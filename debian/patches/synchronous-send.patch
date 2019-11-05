@@ -1,0 +1,259 @@
+--- a/auth.go
++++ b/auth.go
+@@ -116,7 +116,6 @@
+ 						return err
+ 					}
+ 					go conn.inWorker()
+-					go conn.outWorker()
+ 					return nil
+ 				}
+ 			}
+--- a/conn.go
++++ b/conn.go
+@@ -49,9 +49,7 @@
+ 
+ 	handler Handler
+ 
+-	out    chan *Message
+-	closed bool
+-	outLck sync.RWMutex
++	outHandler *outputHandler
+ 
+ 	signalHandler SignalHandler
+ 
+@@ -197,9 +195,9 @@
+ 	conn := new(Conn)
+ 	conn.transport = tr
+ 	conn.calls = make(map[uint32]*Call)
+-	conn.out = make(chan *Message, 10)
+ 	conn.handler = handler
+ 	conn.signalHandler = signalHandler
++	conn.outHandler = &outputHandler{conn: conn}
+ 	conn.nextSerial = 1
+ 	conn.serialUsed = map[uint32]bool{0: true}
+ 	conn.busObj = conn.Object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+@@ -216,18 +214,7 @@
+ // and the channels passed to Eavesdrop and Signal are closed. This method must
+ // not be called on shared connections.
+ func (conn *Conn) Close() error {
+-	conn.outLck.Lock()
+-	if conn.closed {
+-		// inWorker calls Close on read error, the read error may
+-		// be caused by another caller calling Close to shutdown the
+-		// dbus connection, a double-close scenario we prevent here.
+-		conn.outLck.Unlock()
+-		return nil
+-	}
+-	close(conn.out)
+-	conn.closed = true
+-	conn.outLck.Unlock()
+-
++	conn.outHandler.close()
+ 	if term, ok := conn.signalHandler.(Terminator); ok {
+ 		term.Terminate()
+ 	}
+@@ -433,25 +420,30 @@
+ 
+ // outWorker runs in an own goroutine, encoding and sending messages that are
+ // sent to conn.out.
+-func (conn *Conn) outWorker() {
+-	for msg := range conn.out {
+-		err := conn.SendMessage(msg)
+-		conn.callsLck.RLock()
+-		if err != nil {
+-			if c := conn.calls[msg.serial]; c != nil {
+-				c.Err = err
+-				c.Done <- c
+-			}
+-			conn.serialLck.Lock()
+-			delete(conn.serialUsed, msg.serial)
+-			conn.serialLck.Unlock()
+-		} else if msg.Type != TypeMethodCall {
+-			conn.serialLck.Lock()
+-			delete(conn.serialUsed, msg.serial)
+-			conn.serialLck.Unlock()
+-		}
+-		conn.callsLck.RUnlock()
++func (conn *Conn) sendMessage(msg *Message) {
++	conn.sendMessageAndIfClosed(msg, func() {})
++}
++func (conn *Conn) sendMessageAndIfClosed(msg *Message, ifClosed func()) {
++	err := conn.outHandler.sendAndIfClosed(msg, ifClosed)
++	conn.finalizeCall(msg, err)
++}
++
++func (conn *Conn) finalizeCall(msg *Message, err error) {
++	conn.callsLck.RLock()
++	if err != nil {
++		if c := conn.calls[msg.serial]; c != nil {
++			c.Err = err
++			c.Done <- c
++		}
++		conn.serialLck.Lock()
++		delete(conn.serialUsed, msg.serial)
++		conn.serialLck.Unlock()
++	} else if msg.Type != TypeMethodCall {
++		conn.serialLck.Lock()
++		delete(conn.serialUsed, msg.serial)
++		conn.serialLck.Unlock()
+ 	}
++	conn.callsLck.RUnlock()
+ }
+ 
+ // Send sends the given message to the message bus. You usually don't need to
+@@ -481,23 +473,20 @@
+ 		conn.callsLck.Lock()
+ 		conn.calls[msg.serial] = call
+ 		conn.callsLck.Unlock()
+-		conn.outLck.RLock()
+-		if conn.closed {
++		conn.sendMessageAndIfClosed(msg, func() {
+ 			call.Err = ErrClosed
+ 			call.Done <- call
+-		} else {
+-			conn.out <- msg
+-		}
+-		conn.outLck.RUnlock()
++		})
+ 	} else {
+-		conn.outLck.RLock()
+-		if conn.closed {
++		var closed bool
++		conn.sendMessageAndIfClosed(msg, func() {
++			closed = true
++		})
++		if closed {
+ 			call = &Call{Err: ErrClosed}
+ 		} else {
+-			conn.out <- msg
+ 			call = &Call{Err: nil}
+ 		}
+-		conn.outLck.RUnlock()
+ 	}
+ 	return call
+ }
+@@ -530,11 +519,7 @@
+ 	if len(e.Body) > 0 {
+ 		msg.Headers[FieldSignature] = MakeVariant(SignatureOf(e.Body...))
+ 	}
+-	conn.outLck.RLock()
+-	if !conn.closed {
+-		conn.out <- msg
+-	}
+-	conn.outLck.RUnlock()
++	conn.sendMessage(msg)
+ }
+ 
+ // sendReply creates a method reply message corresponding to the parameters and
+@@ -552,11 +537,7 @@
+ 	if len(values) > 0 {
+ 		msg.Headers[FieldSignature] = MakeVariant(SignatureOf(values...))
+ 	}
+-	conn.outLck.RLock()
+-	if !conn.closed {
+-		conn.out <- msg
+-	}
+-	conn.outLck.RUnlock()
++	conn.sendMessage(msg)
+ }
+ 
+ func (conn *Conn) defaultSignalAction(fn func(h *defaultSignalHandler, ch chan<- *Signal), ch chan<- *Signal) {
+@@ -691,3 +672,30 @@
+ 	}
+ 	return ""
+ }
++
++type outputHandler struct {
++	conn    *Conn
++	sendLck sync.Mutex
++	closed  struct {
++		isClosed bool
++		lck      sync.RWMutex
++	}
++}
++
++func (h *outputHandler) sendAndIfClosed(msg *Message, ifClosed func()) error {
++	h.closed.lck.RLock()
++	defer h.closed.lck.RUnlock()
++	if h.closed.isClosed {
++		ifClosed()
++		return nil
++	}
++	h.sendLck.Lock()
++	defer h.sendLck.Unlock()
++	return h.conn.SendMessage(msg)
++}
++
++func (h *outputHandler) close() {
++	h.closed.lck.Lock()
++	defer h.closed.lck.Unlock()
++	h.closed.isClosed = true
++}
+--- a/export.go
++++ b/export.go
+@@ -170,11 +170,8 @@
+ 			reply.Body[i] = ret[i]
+ 		}
+ 		reply.Headers[FieldSignature] = MakeVariant(SignatureOf(reply.Body...))
+-		conn.outLck.RLock()
+-		if !conn.closed {
+-			conn.out <- reply
+-		}
+-		conn.outLck.RUnlock()
++
++		conn.sendMessage(reply)
+ 	}
+ }
+ 
+@@ -207,12 +204,14 @@
+ 	if len(values) > 0 {
+ 		msg.Headers[FieldSignature] = MakeVariant(SignatureOf(values...))
+ 	}
+-	conn.outLck.RLock()
+-	defer conn.outLck.RUnlock()
+-	if conn.closed {
++
++	var closed bool
++	conn.sendMessageAndIfClosed(msg, func() {
++		closed = true
++	})
++	if closed {
+ 		return ErrClosed
+ 	}
+-	conn.out <- msg
+ 	return nil
+ }
+ 
+--- a/object.go
++++ b/object.go
+@@ -85,22 +85,20 @@
+ 		o.conn.callsLck.Lock()
+ 		o.conn.calls[msg.serial] = call
+ 		o.conn.callsLck.Unlock()
+-		o.conn.outLck.RLock()
+-		if o.conn.closed {
++		o.conn.sendMessageAndIfClosed(msg, func() {
+ 			call.Err = ErrClosed
+ 			call.Done <- call
+-		} else {
+-			o.conn.out <- msg
+-		}
+-		o.conn.outLck.RUnlock()
++		})
+ 		return call
+ 	}
+-	o.conn.outLck.RLock()
+-	defer o.conn.outLck.RUnlock()
+-	if o.conn.closed {
++
++	var closed bool
++	o.conn.sendMessageAndIfClosed(msg, func() {
++		closed = true
++	})
++	if closed {
+ 		return &Call{Err: ErrClosed}
+ 	}
+-	o.conn.out <- msg
+ 	return &Call{Err: nil}
+ }
+ 

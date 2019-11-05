@@ -1,0 +1,46 @@
+---
+ conn_other.go |   19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+--- a/conn_other.go
++++ b/conn_other.go
+@@ -3,10 +3,10 @@
+ package dbus
+ 
+ import (
+-	"bytes"
+ 	"errors"
+ 	"os"
+ 	"os/exec"
++	"strings"
+ )
+ 
+ func getSessionBusPlatformAddress() (string, error) {
+@@ -17,14 +17,23 @@ func getSessionBusPlatformAddress() (str
+ 		return "", err
+ 	}
+ 
+-	i := bytes.IndexByte(b, '=')
+-	j := bytes.IndexByte(b, '\n')
++	line := ""
++	for _, line = range strings.Split(string(b), "\n") {
++		if strings.Contains(line, "DBUS_SESSION_BUS_ADDRESS") {
++			break
++		}
++	}
+ 
+-	if i == -1 || j == -1 {
++	if line == "" {
+ 		return "", errors.New("dbus: couldn't determine address of session bus")
+ 	}
+ 
+-	env, addr := string(b[0:i]), string(b[i+1:j])
++	i := strings.Index(line, "=")
++	if i == -1 {
++		return "", errors.New("dbus: couldn't parse address of session bus")
++	}
++
++	env, addr := line[:i], line[i+1:]
+ 	os.Setenv(env, addr)
+ 
+ 	return addr, nil
